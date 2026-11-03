@@ -46,14 +46,18 @@ def normalize(value):
     return re.sub(r"[^a-z0-9]", "", value)
 
 
-def is_own_channel(channel, producer, handle, own_id, channel_id):
+def is_own_channel(channel, aliases, handle, own_id, channel_id):
     if own_id and channel_id == own_id:
         return True
     value = normalize(channel)
-    name = normalize(producer)
     if handle and value == normalize(handle):
         return True
-    return value == name or value in {name + "beats", name + "typebeats", "prod" + name, name + "music"}
+    names = producer if isinstance(producer, list) else [producer]
+    for candidate in names:
+        name = normalize(candidate)
+        if value == name or value in {name + "beats", name + "typebeats", "prod" + name, name + "music"}:
+            return True
+    return False
 
 
 def is_instrumental(title, description):
@@ -166,7 +170,7 @@ def scan():
                 title = snippet.get("title", "")
                 channel = snippet.get("channelTitle", "")
                 channel_id = snippet.get("channelId", "")
-                if not video_id or is_own_channel(channel, producer, handle, own_id, channel_id):
+                if not video_id or is_own_channel(channel, aliases, handle, own_id, channel_id):
                     continue
                 entry = videos.setdefault(video_id, {
                     "id": video_id, "title": title, "channel": channel,
@@ -194,7 +198,7 @@ def scan():
                         title = snippet.get("title", "")
                         channel = snippet.get("channelTitle", "")
                         channel_id = snippet.get("channelId", "")
-                        if not video_id or is_own_channel(channel, producer, handle, own_id, channel_id):
+                        if not video_id or is_own_channel(channel, aliases, handle, own_id, channel_id):
                             continue
                         entry = videos.setdefault(video_id, {
                             "id": video_id, "title": title, "channel": channel,
@@ -219,7 +223,7 @@ def scan():
                 video["views"] = int(item.get("statistics", {}).get("viewCount", 0))
         results = []
         for video in videos.values():
-            if is_own_channel(video["channel"], producer, handle, own_id, video["channel_id"]):
+            if is_own_channel(video["channel"], aliases, handle, own_id, video["channel_id"]):
                 continue
             if hide_instrumentals and is_instrumental(video["title"], video["description"]):
                 continue
