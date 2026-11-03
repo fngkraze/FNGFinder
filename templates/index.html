@@ -36,7 +36,7 @@ footer{margin-top:40px;color:var(--muted);font-size:12px}
 <div class="panel">
 <form id="searchForm">
 <div class="formgrid">
-<div><label for="producer">Producer name</label><input id="producer" type="text" maxlength="50" placeholder="e.g. fngkraze" required><small>Eight search variations, including rap songs, official audio and music videos.</small></div>
+<div><label for="producer">Producer names / aliases</label><input id="producer" type="text" maxlength="155" placeholder="fngkraze, fng kraze" required><small>Separate spelling variations with commas (up to 3). Example: mmijordan, mmi jordan.</small></div>
 <div><label for="handle">Your YouTube @handle (optional)</label><input id="handle" type="text" maxlength="40" placeholder="@yourchannel"><small>For precise exclusion. Your producer-name channel is also filtered automatically.</small></div>
 </div>
 <label class="check"><input id="hide" type="checkbox" checked> Hide likely type beats and instrumentals</label>
@@ -66,13 +66,14 @@ form.addEventListener('submit',async ev=>{
   for(const r of last){
    const card=el('article','result');const img=el('img');img.src=r.thumbnail;img.alt='Video thumbnail';img.loading='lazy';card.append(img);
    const body=el('div','body');body.append(el('h3','',r.title),el('div','meta',r.channel+' · '+fmt(r.views)+' views · '+r.published),el('div','pill',r.credit));
+   if(r.matched_aliases?.length)body.append(el('div','meta','Matched keyword: '+r.matched_aliases.join(', ')));
    const link=el('a','','Open on YouTube ↗');link.href=r.url;link.target='_blank';link.rel='noopener noreferrer';body.append(link);card.append(body);results.append(card);
   }
  }catch(err){status.textContent=err.message}finally{go.disabled=false}
 });
 document.querySelector('#export').addEventListener('click',()=>{
- const cols=['title','channel','published','views','credit','url'];
- const csv=[cols,...last.map(r=>cols.map(c=>r[c]??''))].map(row=>row.map(v=>'"'+String(v).replaceAll('"','""')+'"').join(',')).join('\r\n');
+ const cols=['title','channel','published','views','credit','matched_aliases','url'];
+ const csv=[cols,...last.map(r=>cols.map(c=>Array.isArray(r[c])?r[c].join(' | '):(r[c]??'')))].map(row=>row.map(v=>'"'+String(v).replaceAll('"','""')+'"').join(',')).join('\r\n');
  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.download='2oo1finder-results.csv';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1500);
 });
 </script></body></html>
