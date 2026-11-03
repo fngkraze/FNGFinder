@@ -1,172 +1,76 @@
-import csv
-import hmac
-import io
 import os
 import re
-import threading
 import time
+import threading
+import unicodedata
 from datetime import datetime, timezone
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
-APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
-OWN_CHANNEL_ID = os.getenv("OWN_CHANNEL_ID", "").strip()
-OWN_CHANNEL_HANDLE = os.getenv("OWN_CHANNEL_HANDLE", "").strip().lstrip("@").lower()
-SEARCHES = [
-    '"prod. fngkraze"',
-    '"prod by fngkraze"',
-    '"produced by fngkraze"',
-    '"beatmaker fngkraze"',
-    '"prod fngkraze"',
-    '"fngkraze" song',
-]
-cache = {}
 lock = threading.Lock()
-last_scan = 0.0
-COOLDOWN_SECONDS = 120
-CACHE_SECONDS = 3600
+cache = {}
+requests_by_ip = {}
+daily = {"date": "", "count": 0}
+MAX_DAILY_SCANS = int(os.getenv("MAX_DAILY_SCANS", "20"))
+CACHE_SECONDS = 21600
+MAX_IP_SCANS_PER_HOUR = 3
 
 
-def youtube(endpoint, **params):
-    args = {"key": API_KEY, **params}
-    url = "https://www.googleapis.com/youtube/v3/" + endpoint + "?" + urlencode(args)
+def yt(endpoint, **params):
+    url = "https://www.googleapis.com/youtube/v3/" + endpoint + "?" + urlencode({"key": API_KEY, **params})
     try:
-        with urlopen(Request(url, headers={"User-Agent": "FNGFinder/1.0"}), timeout=18) as resp:
-            import json
-            return json.load(resp)
-    except HTTPError as ex:
+        import json
+        with urlopen(Request(url, headers={"User-Agent": "2oo1finder/1.0"}), timeout=20) as response:
+            return json.load(response)
+    except HTTPError as error:
         import json
         try:
-            details = json.loads(ex.read().decode("utf-8"))
-            msg = details.get("error", {}).get("message", str(ex))
+            msg = json.loads(error.read().decode()).get("error", {}).get("message", str(error))
         except Exception:
-            msg = str(ex)
-        raise ValueError(f"YouTube API: {msg}") from ex
-    except (URLError, TimeoutError) as ex:
-        raise ValueError("Could not connect to YouTube. Try again.") from ex
+            msg = str(error)
+        raise ValueError(msg)
+    except (URLError, TimeoutError):
+        raise ValueError("YouTube is temporarily unreachable.")
 
 
-def is_beat_listing(title, description):
-    t = title.lower()
-    d = description.lower()
-    if re.search(r"\b(type beat|free beat|instrumental|beat tutorial|making a beat|fl studio tutorial|beat pack|loop kit|drum kit)\b", t):
+def normalize(value):
+    value = unicodedata.normalize("NFKC", value).lower()
+    return re.sub(r"[^a-z0-9]", "", value)
+
+
+def is_own_channel(channel, producer, handle, own_id, channel_id):
+    if own_id and channel_id == own_id:
         return True
-    if re.search(r"\b(buy this beat|purchase this beat|lease this beat)\b", d) and not re.search(r"\b(official music video|official audio|freestyle)\b", t):
+    value = normalize(channel)
+    name = normalize(producer)
+    if handle and value == normalize(handle):
         return True
-    return False
+    return value == name or value in {name + "beats", name + "typebeats", "prod" + name, name + "music"}
 
 
-def score_video(title, description):
+def is_instrumental(title, description):
     t = title.lower()
-    d = description.lower()
-    score = 0
-    if re.search(r"\b(prod\.?\s*(by\s*)?fngkraze|produced by fngkraze|beatmaker fngkraze)\b", t):
-        score += 5
-    if re.search(r"\b(prod\.?\s*(by\s*)?fngkraze|produced by fngkraze|beatmaker fngkraze)\b", d):
-        score += 4
-    if any(term in t for term in ("official music video", "official audio", "freestyle", "music video", "remix")):
-        score += 2
-    if "fngkraze" in t or "fngkraze" in d:
-        score += 1
-    return score
+    if re.search(r"\b(type beat|free beat|instrumental|beat pack|sample pack|drum kit|loop kit|fl studio tutorial|making a beat)\b", t):
+        return True
+    return bool(re.search(r"\b(buy this beat|lease this beat|purchase this beat)\b", description.lower())
+                and not re.search(r"\b(music video|official audio|freestyle|remix)\b", t))
+
+
+def confidence(title, description, producer):
+    escaped = re.escape(producer)
+    pattern = re.compile(r"(?i)(?:prod\.?\s*(?:by\s*)?|produced\s+by\s+|beatmaker\s+)" + escaped + r"\b")
+    credit = bool(pattern.search(title) or pattern.search(description))
+    return ("Explicit producer credit", 3) if credit else ("Name mention — verify", 1)
 
 
 @app.get("/")
-def index():
-    return render_template("index.html", needs_password=bool(APP_PASSWORD), has_key=bool(API_KEY),
-                           own_handle=OWN_CHANNEL_HANDLE)
-
-
-@app.post("/api/scan")
-def scan():
-    global last_scan
-    if not API_KEY:
-        return jsonify(error="Add YOUTUBE_API_KEY to your Render environment variables first."), 503
-    data = request.get_json(silent=True) or {}
-    if not APP_PASSWORD:
-        return jsonify(error="Set APP_PASSWORD in Render before scanning. This protects your YouTube quota."), 503
-    supplied = str(data.get("password", ""))
-    if not hmac.compare_digest(supplied, APP_PASSWORD):
-        return jsonify(error="Incorrect dashboard password."), 401
-    hide_beats = bool(data.get("hide_beats", True))
-    handle = str(data.get("handle", OWN_CHANNEL_HANDLE)).strip().lstrip("@").lower()[:80]
-    if handle and not re.fullmatch(r"[\w.-]+", handle):
-        return jsonify(error="Invalid channel handle."), 400
-    key = (hide_beats, handle)
-    now = time.time()
-    with lock:
-        hit = cache.get(key)
-        if hit and now - hit[0] < CACHE_SECONDS:
-            return jsonify(**hit[1], cached=True)
-        if now - last_scan < COOLDOWN_SECONDS:
-            return jsonify(error="Scan cooldown active. Retry in a couple of minutes to save API quota."), 429
-        last_scan = now
-
-    excluded_id = OWN_CHANNEL_ID
-    if handle and not excluded_id:
-        try:
-            info = youtube("channels", part="id", forHandle="@" + handle)
-            items = info.get("items", [])
-            if items:
-                excluded_id = items[0]["id"]
-        except ValueError:
-            pass
-
-    found = {}
-    try:
-        for term in SEARCHES:
-            response = youtube("search", part="snippet", type="video", q=term,
-                               maxResults=50, order="relevance", safeSearch="none")
-            for item in response.get("items", []):
-                vid = item.get("id", {}).get("videoId")
-                if not vid:
-                    continue
-                snip = item.get("snippet", {})
-                channel_id = snip.get("channelId", "")
-                channel = snip.get("channelTitle", "")
-                title = snip.get("title", "")
-                desc = snip.get("description", "")
-                if channel_id == excluded_id or channel.lower() == handle or channel.lower() == "@" + handle:
-                    continue
-                if hide_beats and is_beat_listing(title, desc):
-                    continue
-                entry = found.setdefault(vid, {
-                    "id": vid, "title": title, "channel": channel, "channelId": channel_id,
-                    "published": snip.get("publishedAt", "")[:10],
-                    "thumbnail": snip.get("thumbnails", {}).get("medium", {}).get("url", ""),
-                    "url": "https://www.youtube.com/watch?v=" + vid,
-                    "description": desc, "views": 0, "score": score_video(title, desc)
-                })
-                entry["score"] = max(entry["score"], score_video(title, desc))
-
-        vids = list(found)
-        for start in range(0, len(vids), 50):
-            details = youtube("videos", part="snippet,statistics", id=",".join(vids[start:start + 50]))
-            for item in details.get("items", []):
-                vid = item["id"]
-                snip = item.get("snippet", {})
-                if vid not in found:
-                    continue
-                found[vid]["description"] = snip.get("description", "")
-                found[vid]["views"] = int(item.get("statistics", {}).get("viewCount", 0))
-                found[vid]["score"] = score_video(found[vid]["title"], found[vid]["description"])
-        results = [r for r in found.values() if "fngkraze" in (r["title"] + " " + r["description"]).lower()]
-        if hide_beats:
-            results = [r for r in results if not is_beat_listing(r["title"], r["description"])]
-        results.sort(key=lambda r: (-r["score"], -r["views"]))
-        output = {"results": results, "total": len(results),
-                  "searched": SEARCHES, "scanned_at": datetime.now(timezone.utc).isoformat(),
-                  "note": "Candidate credited uses only; review each song. Uncredited audio is not detectable."}
-        with lock:
-            cache[key] = (time.time(), output)
-        return jsonify(**output, cached=False)
-    except ValueError as ex:
-        return jsonify(error=str(ex)), 502
+def home():
+    return render_template("index.html", ready=bool(API_KEY))
 
 
 @app.get("/health")
@@ -174,5 +78,107 @@ def health():
     return jsonify(status="ok")
 
 
+@app.post("/api/scan")
+def scan():
+    if not API_KEY:
+        return jsonify(error="The website owner must configure YOUTUBE_API_KEY on Render."), 503
+    body = request.get_json(silent=True) or {}
+    producer = " ".join(str(body.get("producer", "")).split()).strip()
+    handle = str(body.get("handle", "")).strip().removeprefix("@")
+    hide_instrumentals = body.get("hide_beats", True) is not False
+    if not 2 <= len(producer) <= 50 or not re.fullmatch(r"[\w .'-]+", producer, re.UNICODE):
+        return jsonify(error="Enter a producer name (2–50 letters or numbers)."), 400
+    if handle and (len(handle) > 40 or not re.fullmatch(r"[\w.-]+", handle)):
+        return jsonify(error="Invalid YouTube handle."), 400
+    cache_key = (producer.casefold(), handle.casefold(), hide_instrumentals)
+    now = time.time()
+    today = datetime.now(timezone.utc).date().isoformat()
+    # Bounded shared API quota; cache hits don't use quota.
+    with lock:
+        cached = cache.get(cache_key)
+        if cached and now - cached[0] < CACHE_SECONDS:
+            return jsonify(**cached[1], cached=True)
+        if daily["date"] != today:
+            daily.update(date=today, count=0)
+            requests_by_ip.clear()
+        # Limits apply per server instance. For larger deployments use Redis.
+        ip = request.remote_addr or "unknown"
+        history = [stamp for stamp in requests_by_ip.get(ip, []) if now - stamp < 3600]
+        if len(history) >= MAX_IP_SCANS_PER_HOUR:
+            return jsonify(error="Hourly search limit reached. Please try later."), 429
+        if daily["count"] >= MAX_DAILY_SCANS:
+            return jsonify(error="Today's free search quota is used. Try again tomorrow."), 429
+        history.append(now)
+        requests_by_ip[ip] = history
+        daily["count"] += 1
+
+    own_id = ""
+    if handle:
+        try:
+            chan = yt("channels", part="id", forHandle="@" + handle)
+            own_id = (chan.get("items") or [{}])[0].get("id", "")
+        except ValueError:
+            pass
+
+    queries = [
+        f'"{producer}" "prod"',
+        f'"{producer}" "produced by"',
+        f'"{producer}" "beatmaker"',
+    ]
+    videos = {}
+    try:
+        for query in queries:
+            data = yt("search", part="snippet", q=query, maxResults=50, type="video", order="relevance")
+            for item in data.get("items", []):
+                video_id = item.get("id", {}).get("videoId")
+                snippet = item.get("snippet", {})
+                title = snippet.get("title", "")
+                channel = snippet.get("channelTitle", "")
+                channel_id = snippet.get("channelId", "")
+                description = snippet.get("description", "")
+                if not video_id or is_own_channel(channel, producer, handle, own_id, channel_id):
+                    continue
+                if hide_instrumentals and is_instrumental(title, description):
+                    continue
+                videos[video_id] = {
+                    "id": video_id, "title": title, "channel": channel,
+                    "channel_id": channel_id, "description": description,
+                    "published": snippet.get("publishedAt", "")[:10],
+                    "thumbnail": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
+                    "url": "https://www.youtube.com/watch?v=" + video_id,
+                    "views": 0,
+                }
+        ids = list(videos)
+        for offset in range(0, len(ids), 50):
+            response = yt("videos", part="snippet,statistics", id=",".join(ids[offset:offset+50]))
+            for item in response.get("items", []):
+                video = videos.get(item["id"])
+                if not video:
+                    continue
+                info = item.get("snippet", {})
+                video["description"] = info.get("description", "")
+                video["views"] = int(item.get("statistics", {}).get("viewCount", 0))
+        results = []
+        for video in videos.values():
+            if is_own_channel(video["channel"], producer, handle, own_id, video["channel_id"]):
+                continue
+            if hide_instrumentals and is_instrumental(video["title"], video["description"]):
+                continue
+            if producer.casefold() not in (video["title"] + " " + video["description"]).casefold():
+                continue
+            label, score = confidence(video["title"], video["description"], producer)
+            video["credit"] = label
+            video["score"] = score
+            results.append(video)
+        results.sort(key=lambda v: (-v["score"], -v["views"]))
+        result = {"results": results, "total": len(results), "producer": producer,
+                  "note": "Searches credited mentions, not audio matches. Results are leads, not proof of unauthorized use."}
+        with lock:
+            cache[cache_key] = (time.time(), result)
+        return jsonify(**result, cached=False)
+    except ValueError as error:
+        return jsonify(error="YouTube API error: " + str(error)), 502
+
+
 if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
