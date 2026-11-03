@@ -20,6 +20,8 @@ MAX_DAILY_SCANS = int(os.getenv("MAX_DAILY_SCANS", "5"))
 PAGES_PER_QUERY = max(1, min(5, int(os.getenv("PAGES_PER_QUERY", "2"))))
 CACHE_SECONDS = 21600
 MAX_IP_SCANS_PER_HOUR = 3
+MAX_SEARCH_REQUESTS = 16
+MAX_ALIASES = 3
 
 
 def yt(endpoint, **params):
@@ -62,11 +64,16 @@ def is_instrumental(title, description):
                 and not re.search(r"\b(music video|official audio|freestyle|remix)\b", t))
 
 
-def confidence(title, description, producer):
-    escaped = re.escape(producer)
-    pattern = re.compile(r"(?i)(?:prod\.?\s*(?:by\s*)?|produced\s+by\s+|beatmaker\s+)" + escaped + r"\b")
-    credit = bool(pattern.search(title) or pattern.search(description))
-    return ("Explicit producer credit", 3) if credit else ("Name mention — verify", 1)
+def confidence(title, description, aliases):
+    combined = title + " " + description
+    for alias in aliases:
+        escaped = re.escape(alias)
+        pattern = re.compile(r"(?i)(?:prod\\.?\\s*(?:by\\s*)?|produced\\s+by\\s+|beatmaker\\s+)" + escaped + r"\\b")
+        if pattern.search(combined):
+            return "Explicit producer credit", 3
+    if any(normalize(alias) in normalize(combined) for alias in aliases):
+        return "Name mention — verify", 1
+    return "No visible credit — review", 0
 
 
 @app.get("/")
@@ -84,14 +91,19 @@ def scan():
     if not API_KEY:
         return jsonify(error="The website owner must configure YOUTUBE_API_KEY on Render."), 503
     body = request.get_json(silent=True) or {}
-    producer = " ".join(str(body.get("producer", "")).split()).strip()
+    raw_producer = str(body.get("producer", ""))
+    aliases = list(dict.fromkeys(" ".join(part.split()).strip() for part in raw_producer.split(",")))
+    producer = aliases[0] if aliases else ""
     handle = str(body.get("handle", "")).strip().removeprefix("@")
     hide_instrumentals = body.get("hide_beats", True) is not False
-    if not 2 <= len(producer) <= 50 or not re.fullmatch(r"[\w .'-]+", producer, re.UNICODE):
-        return jsonify(error="Enter a producer name (2–50 letters or numbers)."), 400
+    if not 1 <= len(aliases) <= MAX_ALIASES or any(
+        not 2 <= len(alias) <= 50 or not re.fullmatch(r"[\\w .'-]+", alias, re.UNICODE)
+        for alias in aliases
+    ):
+        return jsonify(error="Enter 1–3 comma-separated producer names (2–50 characters each)."), 400
     if handle and (len(handle) > 40 or not re.fullmatch(r"[\w.-]+", handle)):
         return jsonify(error="Invalid YouTube handle."), 400
-    cache_key = (producer.casefold(), handle.casefold(), hide_instrumentals)
+    cache_key = (tuple(a.casefold() for a in aliases), handle.casefold(), hide_instrumentals)
     now = time.time()
     today = datetime.now(timezone.utc).date().isoformat()
     # Bounded shared API quota; cache hits don't use quota.
@@ -121,46 +133,81 @@ def scan():
         except ValueError:
             pass
 
-    queries = [
-        f'"prod. {producer}"',
-        f'"prod {producer}"',
-        f'"produced by {producer}"',
-        f'"beatmaker {producer}"',
-        f'"prod by {producer}"',
-        f'"{producer}" rap song',
-        f'"{producer}" official audio',
-        f'"{producer}" music video',
-    ]
+    # Search every alias, but never multiply the API cost past the fixed request budget.
+    # A single alias retains the original eight-query, two-page depth.
+    def variations(alias):
+        return [
+            f'"{alias}"',
+            f'"prod. {alias}"',
+            f'"{alias}" rap song',
+            f'"{alias}" music video',
+            f'"produced by {alias}"',
+            f'"beatmaker {alias}"',
+            f'"prod by {alias}"',
+            f'"{alias}" official audio',
+        ]
+
+    queries = [(alias, query) for alias in aliases for query in variations(alias)]
+    # Round-robin variations, so every alias gets early discovery coverage.
+    queries = [(alias, variations(alias)[i]) for i in range(8) for alias in aliases]
+    search_budget = MAX_SEARCH_REQUESTS
     videos = {}
     try:
-        for query in queries:
-            next_page = ""
-            for page_index in range(PAGES_PER_QUERY):
-                params = dict(part="snippet", q=query, maxResults=50,
-                              type="video", order="relevance")
-                if next_page:
-                    params["pageToken"] = next_page
-                data = yt("search", **params)
-                for item in data.get("items", []):
-                    video_id = item.get("id", {}).get("videoId")
-                    snippet = item.get("snippet", {})
-                    title = snippet.get("title", "")
-                    channel = snippet.get("channelTitle", "")
-                    channel_id = snippet.get("channelId", "")
-                    description = snippet.get("description", "")
-                    if not video_id or is_own_channel(channel, producer, handle, own_id, channel_id):
-                        continue
-                    videos[video_id] = {
-                        "id": video_id, "title": title, "channel": channel,
-                        "channel_id": channel_id, "description": description,
-                        "published": snippet.get("publishedAt", "")[:10],
-                        "thumbnail": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
-                        "url": "https://www.youtube.com/watch?v=" + video_id,
-                        "views": 0,
-                    }
+        request_count = 0
+        for alias, query in queries:
+            # Ensure each alias is searched before spending remaining quota on extra pages.
+            if request_count >= search_budget:
+                break
+            data = yt("search", part="snippet", q=query, maxResults=50,
+                      type="video", order="relevance")
+            request_count += 1
+            for item in data.get("items", []):
+                video_id = item.get("id", {}).get("videoId")
+                snippet = item.get("snippet", {})
+                title = snippet.get("title", "")
+                channel = snippet.get("channelTitle", "")
+                channel_id = snippet.get("channelId", "")
+                if not video_id or is_own_channel(channel, producer, handle, own_id, channel_id):
+                    continue
+                entry = videos.setdefault(video_id, {
+                    "id": video_id, "title": title, "channel": channel,
+                    "channel_id": channel_id, "description": snippet.get("description", ""),
+                    "published": snippet.get("publishedAt", "")[:10],
+                    "thumbnail": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
+                    "url": "https://www.youtube.com/watch?v=" + video_id,
+                    "views": 0, "search_aliases": []
+                })
+                if alias not in entry["search_aliases"]:
+                    entry["search_aliases"].append(alias)
+
+            # Preserve multi-page depth for a single alias without exceeding the budget.
+            if len(aliases) == 1 and PAGES_PER_QUERY > 1:
                 next_page = data.get("nextPageToken", "")
-                if not next_page:
-                    break
+                for _ in range(1, PAGES_PER_QUERY):
+                    if not next_page or request_count >= search_budget:
+                        break
+                    extra = yt("search", part="snippet", q=query, maxResults=50,
+                               type="video", order="relevance", pageToken=next_page)
+                    request_count += 1
+                    for item in extra.get("items", []):
+                        video_id = item.get("id", {}).get("videoId")
+                        snippet = item.get("snippet", {})
+                        title = snippet.get("title", "")
+                        channel = snippet.get("channelTitle", "")
+                        channel_id = snippet.get("channelId", "")
+                        if not video_id or is_own_channel(channel, producer, handle, own_id, channel_id):
+                            continue
+                        entry = videos.setdefault(video_id, {
+                            "id": video_id, "title": title, "channel": channel,
+                            "channel_id": channel_id, "description": snippet.get("description", ""),
+                            "published": snippet.get("publishedAt", "")[:10],
+                            "thumbnail": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
+                            "url": "https://www.youtube.com/watch?v=" + video_id,
+                            "views": 0, "search_aliases": []
+                        })
+                        if alias not in entry["search_aliases"]:
+                            entry["search_aliases"].append(alias)
+                    next_page = extra.get("nextPageToken", "")
         ids = list(videos)
         for offset in range(0, len(ids), 50):
             response = yt("videos", part="snippet,statistics", id=",".join(ids[offset:offset+50]))
@@ -177,15 +224,17 @@ def scan():
                 continue
             if hide_instrumentals and is_instrumental(video["title"], video["description"]):
                 continue
-            label, score = confidence(video["title"], video["description"], producer)
-            if normalize(producer) not in normalize(video["title"] + " " + video["description"]):
-                label, score = "No visible credit — review", 0
+            label, score = confidence(video["title"], video["description"], aliases)
+            combined = video["title"] + " " + video["description"]
+            literal_hits = [a for a in aliases if a.casefold() in combined.casefold()]
+            normalized_hits = [a for a in aliases if normalize(a) in normalize(combined)]
+            video["matched_aliases"] = literal_hits or normalized_hits or video["search_aliases"]
             video["credit"] = label
             video["score"] = score
             results.append(video)
         results.sort(key=lambda v: (-v["score"], -v["views"]))
-        result = {"results": results, "total": len(results), "producer": producer,
-                  "note": "Desktop-equivalent eight searches with pagination. Includes name mentions and unmatched leads for review; none establish audio ownership."}
+        result = {"results": results, "total": len(results), "producer": producer, "aliases": aliases,
+                  "note": "Searches every supplied name variation within a fixed 16-search API budget; leads still require review."}
         with lock:
             cache[cache_key] = (time.time(), result)
         return jsonify(**result, cached=False)
