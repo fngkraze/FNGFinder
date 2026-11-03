@@ -36,18 +36,18 @@ footer{margin-top:40px;color:var(--muted);font-size:12px}
 <div class="panel">
 <form id="searchForm">
 <div class="formgrid">
-<div><label for="producer">Producer name</label><input id="producer" type="text" maxlength="50" placeholder="e.g. fngkraze" required><small>We'll look for “prod.”, “produced by”, and “beatmaker” credits.</small></div>
+<div><label for="producer">Producer name</label><input id="producer" type="text" maxlength="50" placeholder="e.g. fngkraze" required><small>Searches producer credits AND name-only mentions.</small></div>
 <div><label for="handle">Your YouTube @handle (optional)</label><input id="handle" type="text" maxlength="40" placeholder="@yourchannel"><small>For precise exclusion. Your producer-name channel is also filtered automatically.</small></div>
 </div>
 <label class="check"><input id="hide" type="checkbox" checked> Hide likely type beats and instrumentals</label>
-<button id="go" type="submit">Find credited songs →</button>
+<button id="go" type="submit">Find songs & mentions →</button>
 <div class="status" id="status" role="status" aria-live="polite"></div>
 </form></div>
 <section id="output" hidden>
-<div class="toolbar"><div><h2 id="count">Results</h2><div class="sub">Songs require review to confirm the production credit.</div></div><button type="button" id="export">Export CSV ↓</button></div>
+<div class="toolbar"><div><h2 id="count">Results</h2><div class="sub">Explicit credits and name-only mentions; verify each match.</div></div><button type="button" id="export">Export CSV ↓</button></div>
 <div id="results" class="results"></div>
 </section>
-<footer>2oo1finder finds producer-name mentions, not uncredited audio matches. Public search is rate-limited to protect YouTube API quota. Not affiliated with YouTube.</footer>
+<footer>2oo1finder includes name mentions, but cannot detect uncredited audio matches. Public search is rate-limited to protect YouTube API quota. Not affiliated with YouTube.</footer>
 </main>
 <script>
 const form=document.querySelector('#searchForm'), status=document.querySelector('#status'), output=document.querySelector('#output'), results=document.querySelector('#results'), go=document.querySelector('#go');
