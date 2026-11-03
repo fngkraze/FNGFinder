@@ -52,7 +52,7 @@ def is_own_channel(channel, aliases, handle, own_id, channel_id):
     value = normalize(channel)
     if handle and value == normalize(handle):
         return True
-    names = producer if isinstance(producer, list) else [producer]
+    names = aliases if isinstance(aliases, list) else [aliases]
     for candidate in names:
         name = normalize(candidate)
         if value == name or value in {name + "beats", name + "typebeats", "prod" + name, name + "music"}:
