@@ -17,10 +17,10 @@ cache = {}
 requests_by_ip = {}
 daily = {"date": "", "count": 0}
 MAX_DAILY_SCANS = int(os.getenv("MAX_DAILY_SCANS", "5"))
-PAGES_PER_QUERY = max(1, min(5, int(os.getenv("PAGES_PER_QUERY", "2"))))
+PAGES_PER_QUERY = 1  # Conserves quota: broad searches return up to 50 videos each
 CACHE_SECONDS = 21600
 MAX_IP_SCANS_PER_HOUR = 3
-MAX_SEARCH_REQUESTS = 16
+MAX_SEARCH_REQUESTS = 6
 MAX_ALIASES = 3
 
 
@@ -137,22 +137,10 @@ def scan():
         except ValueError:
             pass
 
-    # Search every alias, but never multiply the API cost past the fixed request budget.
-    # A single alias retains the original eight-query, two-page depth.
-    def variations(alias):
-        return [
-            f'"{alias}"',
-            f'"prod. {alias}"',
-            f'"{alias}" rap song',
-            f'"{alias}" music video',
-            f'"produced by {alias}"',
-            f'"beatmaker {alias}"',
-            f'"prod by {alias}"',
-            f'"{alias}" official audio',
-        ]
-
-    # Round-robin variations, so every alias gets early discovery coverage.
-    queries = [(alias, variations(alias)[i]) for i in range(8) for alias in aliases]
+    # Broader queries return more name-only songs per unit than eight narrowly phrased searches.
+    # Every alias gets up to two complementary searches; total max six requests.
+    queries = [(alias, f'"{alias}"') for alias in aliases]
+    queries += [(alias, f'"{alias}" music video') for alias in aliases]
     search_budget = MAX_SEARCH_REQUESTS
     videos = {}
     try:
@@ -183,34 +171,6 @@ def scan():
                 if alias not in entry["search_aliases"]:
                     entry["search_aliases"].append(alias)
 
-            # Preserve multi-page depth for a single alias without exceeding the budget.
-            if len(aliases) == 1 and PAGES_PER_QUERY > 1:
-                next_page = data.get("nextPageToken", "")
-                for _ in range(1, PAGES_PER_QUERY):
-                    if not next_page or request_count >= search_budget:
-                        break
-                    extra = yt("search", part="snippet", q=query, maxResults=50,
-                               type="video", order="relevance", pageToken=next_page)
-                    request_count += 1
-                    for item in extra.get("items", []):
-                        video_id = item.get("id", {}).get("videoId")
-                        snippet = item.get("snippet", {})
-                        title = snippet.get("title", "")
-                        channel = snippet.get("channelTitle", "")
-                        channel_id = snippet.get("channelId", "")
-                        if not video_id or is_own_channel(channel, aliases, handle, own_id, channel_id):
-                            continue
-                        entry = videos.setdefault(video_id, {
-                            "id": video_id, "title": title, "channel": channel,
-                            "channel_id": channel_id, "description": snippet.get("description", ""),
-                            "published": snippet.get("publishedAt", "")[:10],
-                            "thumbnail": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
-                            "url": "https://www.youtube.com/watch?v=" + video_id,
-                            "views": 0, "search_aliases": []
-                        })
-                        if alias not in entry["search_aliases"]:
-                            entry["search_aliases"].append(alias)
-                    next_page = extra.get("nextPageToken", "")
         ids = list(videos)
         for offset in range(0, len(ids), 50):
             response = yt("videos", part="snippet,statistics", id=",".join(ids[offset:offset+50]))
@@ -237,12 +197,15 @@ def scan():
             results.append(video)
         results.sort(key=lambda v: (-v["score"], -v["views"]))
         result = {"results": results, "total": len(results), "producer": producer, "aliases": aliases,
-                  "note": "Searches every supplied name variation within a fixed 16-search API budget; leads still require review."}
+                  "note": "Quota-efficient discovery: up to two broad searches per alias. Name-only matches are included; verify songs manually."}
         with lock:
             cache[cache_key] = (time.time(), result)
         return jsonify(**result, cached=False)
     except ValueError as error:
-        return jsonify(error="YouTube API error: " + str(error)), 502
+        message = str(error)
+        if "quota" in message.lower() or "dailylimit" in message.lower():
+            return jsonify(error="YouTube's daily API quota is exhausted. It usually resets at midnight Pacific time. Try again after the reset."), 429
+        return jsonify(error="YouTube API error: " + message), 502
 
 
 if __name__ == "__main__":
