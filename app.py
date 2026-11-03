@@ -124,6 +124,7 @@ def scan():
         f'"{producer}" "prod"',
         f'"{producer}" "produced by"',
         f'"{producer}" "beatmaker"',
+        f'"{producer}"',  # Broad search: catches name-only mentions in titles or descriptions.
     ]
     videos = {}
     try:
@@ -138,8 +139,7 @@ def scan():
                 description = snippet.get("description", "")
                 if not video_id or is_own_channel(channel, producer, handle, own_id, channel_id):
                     continue
-                if hide_instrumentals and is_instrumental(title, description):
-                    continue
+                # Do not filter using truncated search snippets: full descriptions follow.
                 videos[video_id] = {
                     "id": video_id, "title": title, "channel": channel,
                     "channel_id": channel_id, "description": description,
@@ -164,7 +164,7 @@ def scan():
                 continue
             if hide_instrumentals and is_instrumental(video["title"], video["description"]):
                 continue
-            if producer.casefold() not in (video["title"] + " " + video["description"]).casefold():
+            if normalize(producer) not in normalize(video["title"] + " " + video["description"]):
                 continue
             label, score = confidence(video["title"], video["description"], producer)
             video["credit"] = label
@@ -172,7 +172,7 @@ def scan():
             results.append(video)
         results.sort(key=lambda v: (-v["score"], -v["views"]))
         result = {"results": results, "total": len(results), "producer": producer,
-                  "note": "Searches credited mentions, not audio matches. Results are leads, not proof of unauthorized use."}
+                  "note": "Includes name-only mentions as possible matches; these are not verified credits or audio matches."}
         with lock:
             cache[cache_key] = (time.time(), result)
         return jsonify(**result, cached=False)
