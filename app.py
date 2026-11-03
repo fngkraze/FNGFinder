@@ -68,7 +68,7 @@ def confidence(title, description, aliases):
     combined = title + " " + description
     for alias in aliases:
         escaped = re.escape(alias)
-        pattern = re.compile(r"(?i)(?:prod\\.?\\s*(?:by\\s*)?|produced\\s+by\\s+|beatmaker\\s+)" + escaped + r"\\b")
+        pattern = re.compile(r"(?i)(?:prod\.?\s*(?:by\s*)?|produced\s+by\s+|beatmaker\s+)" + escaped + r"\b")
         if pattern.search(combined):
             return "Explicit producer credit", 3
     if any(normalize(alias) in normalize(combined) for alias in aliases):
@@ -97,7 +97,7 @@ def scan():
     handle = str(body.get("handle", "")).strip().removeprefix("@")
     hide_instrumentals = body.get("hide_beats", True) is not False
     if not 1 <= len(aliases) <= MAX_ALIASES or any(
-        not 2 <= len(alias) <= 50 or not re.fullmatch(r"[\\w .'-]+", alias, re.UNICODE)
+        not 2 <= len(alias) <= 50 or not re.fullmatch(r"[\w .'-]+", alias, re.UNICODE)
         for alias in aliases
     ):
         return jsonify(error="Enter 1–3 comma-separated producer names (2–50 characters each)."), 400
@@ -147,7 +147,6 @@ def scan():
             f'"{alias}" official audio',
         ]
 
-    queries = [(alias, query) for alias in aliases for query in variations(alias)]
     # Round-robin variations, so every alias gets early discovery coverage.
     queries = [(alias, variations(alias)[i]) for i in range(8) for alias in aliases]
     search_budget = MAX_SEARCH_REQUESTS
