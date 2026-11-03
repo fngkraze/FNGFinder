@@ -9,4 +9,7 @@ services:
       - key: YOUTUBE_API_KEY
         sync: false
       - key: MAX_DAILY_SCANS
-        value: 20
+        value: 5
+
+      - key: PAGES_PER_QUERY
+        value: 2
