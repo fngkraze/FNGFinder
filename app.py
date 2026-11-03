@@ -16,7 +16,8 @@ lock = threading.Lock()
 cache = {}
 requests_by_ip = {}
 daily = {"date": "", "count": 0}
-MAX_DAILY_SCANS = int(os.getenv("MAX_DAILY_SCANS", "20"))
+MAX_DAILY_SCANS = int(os.getenv("MAX_DAILY_SCANS", "5"))
+PAGES_PER_QUERY = max(1, min(5, int(os.getenv("PAGES_PER_QUERY", "2"))))
 CACHE_SECONDS = 21600
 MAX_IP_SCANS_PER_HOUR = 3
 
@@ -121,33 +122,45 @@ def scan():
             pass
 
     queries = [
-        f'"{producer}" "prod"',
-        f'"{producer}" "produced by"',
-        f'"{producer}" "beatmaker"',
-        f'"{producer}"',  # Broad search: catches name-only mentions in titles or descriptions.
+        f'"prod. {producer}"',
+        f'"prod {producer}"',
+        f'"produced by {producer}"',
+        f'"beatmaker {producer}"',
+        f'"prod by {producer}"',
+        f'"{producer}" rap song',
+        f'"{producer}" official audio',
+        f'"{producer}" music video',
     ]
     videos = {}
     try:
         for query in queries:
-            data = yt("search", part="snippet", q=query, maxResults=50, type="video", order="relevance")
-            for item in data.get("items", []):
-                video_id = item.get("id", {}).get("videoId")
-                snippet = item.get("snippet", {})
-                title = snippet.get("title", "")
-                channel = snippet.get("channelTitle", "")
-                channel_id = snippet.get("channelId", "")
-                description = snippet.get("description", "")
-                if not video_id or is_own_channel(channel, producer, handle, own_id, channel_id):
-                    continue
-                # Do not filter using truncated search snippets: full descriptions follow.
-                videos[video_id] = {
-                    "id": video_id, "title": title, "channel": channel,
-                    "channel_id": channel_id, "description": description,
-                    "published": snippet.get("publishedAt", "")[:10],
-                    "thumbnail": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
-                    "url": "https://www.youtube.com/watch?v=" + video_id,
-                    "views": 0,
-                }
+            next_page = ""
+            for page_index in range(PAGES_PER_QUERY):
+                params = dict(part="snippet", q=query, maxResults=50,
+                              type="video", order="relevance")
+                if next_page:
+                    params["pageToken"] = next_page
+                data = yt("search", **params)
+                for item in data.get("items", []):
+                    video_id = item.get("id", {}).get("videoId")
+                    snippet = item.get("snippet", {})
+                    title = snippet.get("title", "")
+                    channel = snippet.get("channelTitle", "")
+                    channel_id = snippet.get("channelId", "")
+                    description = snippet.get("description", "")
+                    if not video_id or is_own_channel(channel, producer, handle, own_id, channel_id):
+                        continue
+                    videos[video_id] = {
+                        "id": video_id, "title": title, "channel": channel,
+                        "channel_id": channel_id, "description": description,
+                        "published": snippet.get("publishedAt", "")[:10],
+                        "thumbnail": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
+                        "url": "https://www.youtube.com/watch?v=" + video_id,
+                        "views": 0,
+                    }
+                next_page = data.get("nextPageToken", "")
+                if not next_page:
+                    break
         ids = list(videos)
         for offset in range(0, len(ids), 50):
             response = yt("videos", part="snippet,statistics", id=",".join(ids[offset:offset+50]))
@@ -164,15 +177,15 @@ def scan():
                 continue
             if hide_instrumentals and is_instrumental(video["title"], video["description"]):
                 continue
-            if normalize(producer) not in normalize(video["title"] + " " + video["description"]):
-                continue
             label, score = confidence(video["title"], video["description"], producer)
+            if normalize(producer) not in normalize(video["title"] + " " + video["description"]):
+                label, score = "No visible credit — review", 0
             video["credit"] = label
             video["score"] = score
             results.append(video)
         results.sort(key=lambda v: (-v["score"], -v["views"]))
         result = {"results": results, "total": len(results), "producer": producer,
-                  "note": "Includes name-only mentions as possible matches; these are not verified credits or audio matches."}
+                  "note": "Desktop-equivalent eight searches with pagination. Includes name mentions and unmatched leads for review; none establish audio ownership."}
         with lock:
             cache[cache_key] = (time.time(), result)
         return jsonify(**result, cached=False)
